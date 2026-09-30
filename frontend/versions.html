@@ -357,6 +357,7 @@ async function showFileHistory(path) {
           <span class="chip">${esc(h.commit.short)}</span>
           <span class="badge plain ${h.state === "deleted" ? "bad" : "ok"}">${h.state}</span>
           <span class="spacer" style="flex:1"></span>
+          <button class="btn xs fh-blame" data-ref="${esc(h.commit.id)}">☰ 溯源</button>
           <button class="btn xs fh-view" data-ref="${esc(h.commit.id)}">查看</button>
           ${h.state !== "deleted" ? `<button class="btn xs fh-restore" data-ref="${esc(h.commit.id)}" title="把该版本恢复为当前文件">↩ 恢复</button>` : ""}
         </div>
@@ -364,6 +365,9 @@ async function showFileHistory(path) {
       </div>`).join("");
     box.querySelectorAll(".fh-view").forEach(b => b.onclick = () => {
       location.href = `diff.html?a=${encodeURIComponent(b.dataset.ref)}&b=WORKING&path=${encodeURIComponent(path)}`;
+    });
+    box.querySelectorAll(".fh-blame").forEach(b => b.onclick = () => {
+      location.href = `blame.html?path=${encodeURIComponent(path)}&ref=${encodeURIComponent(b.dataset.ref)}`;
     });
     box.querySelectorAll(".fh-restore").forEach(b => b.onclick = async () => {
       confirmDlg(`把 ${path} 恢复到 ${b.dataset.ref.slice(0, 12)} 的版本？`, async () => {

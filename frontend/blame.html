@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>逐行溯源 · DFSVS</title>
+<link rel="stylesheet" href="css/app.css">
+<style>
+  .blame-toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .blame-toolbar .pathbox {
+    font-family:var(--mono); font-size:13px; background:var(--bg-soft);
+    border:1px solid var(--border-soft); border-radius:6px; padding:6px 10px;
+    flex:1; min-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  /* 虚拟滚动容器：固定行高，滚动事件驱动渲染窗口，扛得住几十万行 */
+  .blame-scroll {
+    position:relative; height:calc(100vh - 250px); min-height:320px; overflow:auto;
+    background:#0c1017; border:1px solid var(--border-soft); border-radius:8px;
+    font-family:var(--mono); font-size:12.5px;
+  }
+  .blame-canvas { position:relative; width:100%; }
+  .blame-row {
+    position:absolute; left:0; right:0; height:20px; line-height:20px;
+    display:flex; align-items:stretch; white-space:nowrap; cursor:pointer;
+  }
+  .blame-row:hover { background:rgba(79,140,255,.10) !important; }
+  .blame-row .b-gutter {
+    flex:0 0 30px; text-align:right; padding-right:8px; color:var(--muted);
+    user-select:none; border-right:1px solid var(--border-soft);
+  }
+  .blame-row .b-meta {
+    flex:0 0 250px; overflow:hidden; padding-left:10px; user-select:none;
+    display:flex; align-items:center; gap:6px; border-right:1px solid var(--border-soft);
+  }
+  .blame-row .b-code {
+    flex:1 1 auto; padding-left:10px; overflow:hidden; text-overflow:ellipsis;
+    white-space:pre;
+  }
+  .b-author { font-weight:600; width:64px; overflow:hidden; text-overflow:ellipsis; flex:0 0 auto; }
+  .b-short { color:var(--accent); font-size:11px; flex:0 0 auto; }
+  .b-ts { color:var(--muted); font-size:11px; flex:0 0 auto; }
+  .b-merged { font-size:10px; line-height:1; padding:2px 5px; border-radius:8px;
+               background:rgba(155,108,255,.18); color:#c3a7ff; border:1px solid rgba(155,108,255,.4);
+               flex:0 0 auto; }
+  .b-dirty { font-size:10px; padding:2px 5px; border-radius:8px; background:rgba(240,165,56,.18);
+             color:#f5c378; border:1px solid rgba(240,165,56,.4); flex:0 0 auto; }
+  .b-start .b-meta { border-left:3px solid var(--accent); }
+  .blame-scroll .blame-row[data-merge="1"] .b-start-marker {}
+  /* 分组之间的分隔线（只在每组首行画一条顶边） */
+  .blame-row.grp-start { box-shadow: inset 0 1px 0 var(--border-soft); }
+  .blame-legend { display:flex; gap:14px; align-items:center; font-size:12px; color:var(--muted); flex-wrap:wrap; }
+  .swatch { display:inline-block; width:11px; height:11px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  .blame-summary { font-size:12.5px; color:var(--muted); font-family:var(--mono); }
+  .blame-summary b { color:var(--text); }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar" class="sidebar"></aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">逐行溯源</h1>
+        <div class="sub" id="page-sub">git blame · 每行来自哪次提交 / 谁 / 何时 · 区分合并带入</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="userchip" id="userchip"></div>
+    </header>
+
+    <section class="content">
+      <div class="card">
+        <div class="blame-toolbar">
+          <label class="fl" style="margin:0">文件
+            <input type="text" id="blame-path" style="min-width:280px" placeholder="/docs/readme.md"></label>
+          <label class="fl" style="margin:0">引用
+            <select id="blame-ref" style="min-width:200px"></select></label>
+          <button class="btn primary sm" id="blame-run">溯源</button>
+          <span class="spacer" style="flex:1"></span>
+          <button class="btn sm ghost" id="blame-copy" title="以纯文本形式复制">⧉ 复制</button>
+          <a class="btn sm ghost" id="blame-history" href="versions.html">⑂ 版本历史</a>
+        </div>
+        <div class="blame-legend" style="margin-top:10px">
+          <span><span class="swatch" style="background:var(--accent)"></span>本分支直接修改</span>
+          <span><span class="swatch" style="background:#9b6cff"></span>合并带入（颜色块在元信息列）</span>
+          <span><span class="swatch" style="background:#f0a538"></span>未提交的工作区修改</span>
+          <span class="spacer" style="flex:1"></span>
+          <span class="blame-summary" id="blame-summary"></span>
+        </div>
+      </div>
+
+      <div class="card" style="padding:0;overflow:hidden">
+        <div class="blame-scroll" id="blame-scroll">
+          <div class="blame-canvas" id="blame-canvas"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toasts"></div>
+<script src="js/app.js"></script>
+<script>
+"use strict";
+const { api, esc, fmtTs, fmtAgo, fmtBytes, toast } = DFSVS;
+
+const ROW_H = 20;
+const OVERSCAN = 18;
+
+let state = {
+  path: DFSVS.qs("path", ""),
+  ref: DFSVS.qs("ref", ""),
+  data: null,
+  // 展开成逐行数组（仅存 commitId / mergedInId / 文本，体量轻）
+  rows: [],
+  refs: [],
+};
+
+const scrollEl = document.getElementById("blame-scroll");
+const canvasEl = document.getElementById("blame-canvas");
+
+// 提交色：用 id 哈希稳定取色（同一提交始终同色）
+const PAL = ["#4f8cff","#2fbf71","#f0a538","#e5534b","#9b6cff",
+             "#39bcd0","#f26ca7","#a3b529","#ff9f43","#6c8eef"];
+function colorFor(cid) {
+  let h = 0;
+  for (let i = 0; i < cid.length; i++) h = (h * 31 + cid.charCodeAt(i)) >>> 0;
+  return PAL[h % PAL.length];
+}
+
+// ------------------------------------------------------------------ 加载
+async function loadRefs() {
+  const [brs, commits] = await Promise.all([
+    api("GET", "/api/version/branches"),
+    api("GET", "/api/version/commits?limit=200"),
+  ]);
+  state.refs = [{ value: "WORKING", label: "★ 工作区（活动文件）" }];
+  brs.branches.forEach(b => state.refs.push({ value: b.name, label: `⑂ ${b.name}` }));
+  commits.commits.forEach(c =>
+    state.refs.push({ value: c.id, label: `· ${c.short} ${c.message.slice(0, 30)}` }));
+  const sel = document.getElementById("blame-ref");
+  sel.innerHTML = state.refs.map(r =>
+    `<option value="${esc(r.value)}">${esc(r.label)}</option>`).join("");
+  sel.value = state.ref || "WORKING";
+}
+
+async function runBlame() {
+  state.path = document.getElementById("blame-path").value.trim();
+  state.ref = document.getElementById("blame-ref").value;
+  if (!state.path) { toast("请填写文件路径", "warn"); return; }
+  const q = new URLSearchParams({ path: state.path });
+  if (state.ref && state.ref !== "WORKING") q.set("ref", state.ref);
+  history.replaceState(null, "", "?" + q.toString());
+  canvasEl.innerHTML = "";
+  document.getElementById("blame-summary").textContent = "溯源中 …";
+  try {
+    const d = await api("GET", "/api/version/blame?" + q.toString());
+    if (!d.is_text) {
+      state.data = null; state.rows = [];
+      canvasEl.style.height = "0px";
+      document.getElementById("blame-summary").innerHTML =
+        `<span class="badge bad plain">二进制或不可读文件，无法逐行溯源</span>`;
+      return;
+    }
+    state.data = d;
+    flatten(d);
+    renderSummary();
+    canvasEl.style.height = (state.rows.length * ROW_H) + "px";
+    scrollEl.scrollTop = 0;
+    renderViewport();
+  } catch (e) {
+    state.data = null; state.rows = [];
+    canvasEl.style.height = "0px";
+    document.getElementById("blame-summary").innerHTML =
+      `<span class="badge bad plain">${esc(e.message)}</span>`;
+  }
+}
+
+function flatten(d) {
+  // groups 与行严格对应：顺序拼出逐行轻量记录，杜绝任何错行可能
+  const rows = new Array(d.line_count);
+  let k = 0;
+  for (const g of d.groups) {
+    for (let i = 0; i < g.lines.length; i++) {
+      rows[k++] = {
+        cid: g.commit,
+        via: g.merged_in || null,
+        text: g.lines[i],
+        groupStart: i === 0,
+        lineNo: g.start + i,
+      };
+    }
+  }
+  state.rows = rows;
+}
+
+function renderSummary() {
+  const d = state.data;
+  const authors = new Set(Object.values(d.commits).map(c => c.author));
+  const merged = d.groups.filter(g => g.merged_in)
+    .reduce((s, g) => s + (g.end - g.start + 1), 0);
+  document.getElementById("blame-summary").innerHTML =
+    `<b>${d.line_count}</b> 行 · <b>${Object.keys(d.commits).length}</b> 次提交 ·
+     <b>${authors.size}</b 位作者 · 合并带入 <b style="color:#c3a7ff">${merged}</b> 行` +
+    (d.truncated ? ` · <span class="badge warn plain">结果已截断/降级</span>` : "") +
+    (d.working_dirty ? ` · <span class="badge warn plain">工作区有未提交修改</span>` : "");
+}
+
+// ------------------------------------------------------------ 虚拟滚动渲染
+function renderViewport() {
+  const d = state.data;
+  if (!d) return;
+  const rows = state.rows;
+  const total = rows.length;
+  const scrollTop = scrollEl.scrollTop;
+  const viewH = scrollEl.clientHeight;
+  let first = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
+  let last = Math.min(total, Math.ceil((scrollTop + viewH) / ROW_H) + OVERSCAN);
+
+  // 用文档片段批量构建，仅渲染可见窗口（通常 < 80 行）
+  const frag = document.createDocumentFragment();
+  for (let i = first; i < last; i++) {
+    const r = rows[i];
+    const c = d.commits[r.cid];
+    const via = r.via ? d.commits[r.via] : null;
+    const color = colorFor(r.cid);
+    const isDirty = r.cid === "WORKING";
+    const row = document.createElement("div");
+    row.className = "blame-row" + (r.groupStart ? " grp-start" : "");
+    row.style.top = (i * ROW_H) + "px";
+    row.dataset.idx = i;
+    // 整行左侧 3px 色条标识归属提交；合并带入用紫色元信息徽章区分
+    const bar = r.groupStart
+      ? `border-left:3px solid ${isDirty ? "#f0a538" : color};`
+      : `border-left:3px solid transparent;`;
+    row.setAttribute("style",
+      `top:${i * ROW_H}px;${bar}` +
+      (r.groupStart ? "" : ""));
+    const meta = r.groupStart ? `
+      <span class="b-author" style="color:${isDirty ? "#f5c378" : color}">${esc(c.author)}</span>
+      <span class="b-short">${esc(c.short)}</span>
+      <span class="b-ts">${esc(fmtTs(c.ts).slice(5, 16))}</span>
+      ${via ? `<span class="b-merged" title="由 ${esc(via.author)} 执行合并 ${esc(via.short)} 带入本分支">⇄ 合并带入</span>` : ""}
+      ${isDirty ? `<span class="b-dirty">未提交</span>` : ""}
+    ` : "";
+    row.innerHTML =
+      `<span class="b-gutter">${r.lineNo}</span>` +
+      `<span class="b-meta">${meta}</span>` +
+      `<span class="b-code">${esc(r.text) || " "}</span>`;
+    row.onclick = () => openCommit(r);
+    frag.appendChild(row);
+  }
+  canvasEl.innerHTML = "";
+  canvasEl.appendChild(frag);
+}
+
+let rafPending = false;
+scrollEl.addEventListener("scroll", () => {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => { rafPending = false; renderViewport(); });
+}, { passive: true });
+
+// 行号 / 内容严格对齐自检（开发期断言；行由后端 groups 顺序展开，天然对齐）
+function assertAlignment() {
+  const d = state.data;
+  if (!d) return;
+  let n = 0, no = 1;
+  for (const g of d.groups) {
+    if (g.start !== no) console.error("组起始行号不连续", g.start, no);
+    n += g.lines.length;
+    no = g.end + 1;
+  }
+  if (n !== d.line_count) console.error("行数不符", n, d.line_count);
+}
+
+// ------------------------------------------------------------ 提交详情弹窗
+async function openCommit(r) {
+  const d = state.data;
+  const c = d.commits[r.cid];
+  const via = r.via ? d.commits[r.via] : null;
+  const modal = DFSVS.modal({
+    title: `提交 ${c.short}`,
+    wide: true,
+    hideCancel: true,
+    okText: "关闭",
+    body: `<div class="small muted">加载中 …</div>`,
+  });
+  const body = modal.el.querySelector(".m-body");
+  const parents = (c.parent_ids || []).map(p => p.slice(2, 10)).join(", ") || "（根提交）";
+  // 本次提交相对其第一父的差异（merge 提交会额外标注第二父）
+  let diffHtml = `<div class="small muted">正在加载差异 …</div>`;
+  try {
+    if (r.cid !== "WORKING") {
+      const parent = (c.parent_ids || [])[0] || "";
+      const dd = await api("GET",
+        `/api/version/diff?a=${encodeURIComponent(parent)}&b=${encodeURIComponent(r.cid)}`);
+      const ch = dd.changes.find(x => x.path === state.path);
+      if (ch) {
+        diffHtml = `
+          <div class="small muted" style="margin:6px 0">
+            本提交对该文件：<b class="${ch.kind === "added" ? "" : ""}">${ch.kind}</b>
+            ${ch.adds !== undefined ? ` · <span style="color:var(--ok)">+${ch.adds}</span> <span style="color:var(--bad)">-${ch.dels}</span>` : ""}
+          </div>
+          <a class="btn sm primary" target="_blank"
+             href="diff.html?a=${encodeURIComponent(parent)}&b=${encodeURIComponent(r.cid)}&path=${encodeURIComponent(state.path)}">
+            ± 打开完整行级差异</a>`;
+      } else {
+        diffHtml = `<div class="small muted">本提交未改动该文件内容。</div>`;
+      }
+    } else {
+      diffHtml = `<div class="small muted">工作区尚未提交。
+        <a href="diff.html?a=HEAD&b=WORKING&path=${encodeURIComponent(state.path)}">查看工作区差异</a></div>`;
+    }
+  } catch (e) {
+    diffHtml = `<div class="small muted">差异加载失败：${esc(e.message)}</div>`;
+  }
+
+  body.innerHTML = `
+    <div style="font-size:14px; margin-bottom:10px">${esc(c.message)}</div>
+    <div class="kv" style="margin-bottom:10px">
+      <span class="k">完整 ID</span><span class="v">${esc(r.cid === "WORKING" ? "WORKING（未提交）" : r.cid)}</span>
+      <span class="k">作者</span><span class="v">${esc(c.author)}</span>
+      <span class="k">时间</span><span class="v">${fmtTs(c.ts)}（${fmtAgo(c.ts)}）</span>
+      <span class="k">父提交</span><span class="v">${esc(parents)}</span>
+      ${c.refs && c.refs.length ? `<span class="k">分支引用</span><span class="v">${c.refs.map(esc).join(", ")}</span>` : ""}
+      ${c.is_merge ? `<span class="k">类型</span><span class="v"><span class="badge violet plain">合并提交</span></span>` : ""}
+      ${c.merge_info ? `<span class="k">合并来源</span><span class="v">${esc(c.merge_info.source || "")} → ${esc(c.merge_info.target || "")} · base ${esc(c.merge_info.base || "")}${c.merge_info.clean ? "" : " · 含冲突"}</span>` : ""}
+    </div>
+    ${via ? `<div class="trace-box" style="margin-bottom:10px">
+      <div class="step">⇄ 第 <b>${r.lineNo}</b> 行是<b style="color:#c3a7ff">合并带入</b>的：
+        由 <b>${esc(via.author)}</b> 执行合并 <span class="chip">${esc(via.short)}</span>
+        「${esc(via.message)}」从侧分支带入；该行真正的作者仍是
+        <b style="color:${colorFor(r.cid)}">${esc(c.author)}</b>，不计到 ${esc(via.author)} 头上。</div></div>` : ""}
+    <hr class="hr">
+    ${diffHtml}`;
+}
+
+// ------------------------------------------------------------ 复制（等宽纯文本）
+document.getElementById("blame-copy").onclick = async () => {
+  const d = state.data;
+  if (!d) return toast("没有可复制的溯源结果", "warn");
+  const pad = String(d.line_count).length;
+  const lines = state.rows.map(r => {
+    const c = d.commits[r.cid];
+    const tag = r.via ? "[merged] " : "         ";
+    return `${String(r.lineNo).padStart(pad)} ${tag}${c.short} ${c.author.padEnd(8)} ${r.text}`;
+  });
+  try {
+    await navigator.clipboard.writeText(lines.join("\n"));
+    toast("已复制逐行溯源文本", "ok");
+  } catch (e) { toast("复制失败：" + e.message, "bad"); }
+};
+
+// ------------------------------------------------------------ 初始化
+document.getElementById("blame-run").onclick = runBlame;
+document.getElementById("blame-path").addEventListener("keydown", e => {
+  if (e.key === "Enter") runBlame();
+});
+document.getElementById("blame-history").href =
+  "versions.html" + (state.path ? "?path=" + encodeURIComponent(state.path) : "");
+
+initPage("blame.html", "逐行溯源").then(async () => {
+  document.getElementById("blame-path").value = state.path;
+  await loadRefs().catch(e => toast(e.message, "bad"));
+  if (state.path) runBlame();
+  else document.getElementById("blame-summary").textContent =
+    "输入文件路径并选择引用（默认工作区），点击「溯源」";
+});
+</script>
+</body>
+</html>

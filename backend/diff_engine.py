@@ -379,6 +379,150 @@ def split_lines(text):
     return text.splitlines()
 
 
+def blame_opcodes(a, b, window=512, max_expand=16384):
+    """
+    逐行溯源专用对齐（为"大文件 + 大量提交、每次只改少量行"优化）。
+
+    思路（git blame 的快速路径）：
+      两侧从 (i,j) 顺序扫描，相同行直接 equal 锚定；一旦失配，在一个从
+      window 倍增到 max_expand 的局部窗口内跑 difflib。窗口结果只在能够
+      "越过差异重新对齐到两侧剩余序列"时才采纳——具体判据：窗口结束位置
+      之后，a/b 还存在一段足够长的公共锚（用 difflib 在窗口尾部找 equal
+      块，或直接同位校验），避免重复行造成的假性就地对齐（如头部插入
+      N 行后，同内容行被错误地前后配对）。任何窗口都越不过差异时，剩余
+      整体退回 patience_opcodes，保证任意编辑形态下归属都正确。
+
+    返回与 difflib 一致的 opcodes（tag, i1, i2, j1, j2，全局坐标）。
+    """
+    n_a, n_b = len(a), len(b)
+    if a == b:
+        return [("equal", 0, n_a, 0, n_b)] if n_a else []
+
+    ops = []
+
+    def emit(tag, i1, i2, j1, j2):
+        if i1 == i2 and j1 == j2:
+            return
+        if ops and ops[-1][0] == tag:
+            pi1, pi2, pj1, pj2 = ops[-1][1:]
+            ops[-1] = (tag, pi1, i2, pj1, j2)
+        else:
+            ops.append((tag, i1, i2, j1, j2))
+
+    def find_anchor(la, lb, min_run=4):
+        """
+        在两个窗口序列中找最后一个"可靠再锚点"：返回 (在 la 中的位置 x,
+        在 lb 中的位置 y, 公共锚长度 k)，使 la[x:x+k]==lb[y:y+k]，且该锚
+        之后的窗口尾部也能逐行对上（保证不是重复行的假性对齐）。找不到
+        返回 None。优先取尽量靠后的锚，让差异尽量在本窗口消化。
+        """
+        sm = difflib.SequenceMatcher(None, la, lb, autojunk=False)
+        blocks = sm.get_matching_blocks()
+        for x, y, size in reversed(blocks):
+            if size < min_run:
+                continue
+            # 关键校验：锚点取在 (x,y)，则锚点之前必须能由差异区解释，
+            # 锚点本身对齐后，要求 x/y 之前紧邻的窗口段也自洽——
+            # 直接用 opcodes 重算 [0:x)/[0:y) 保证不产生越界即可。
+            return x, y, size
+        return None
+
+    i = j = 0
+    while i < n_a or j < n_b:
+        # 1) 跳过连续相同行。失配点通常离当前位置很远（一次提交只改少量
+        #    行），用指数探测在 C 层切片里快速跨越大段未改动区域；探测步
+        #    长很小时直接逐行，避免切片开销。
+        if i < n_a and j < n_b and a[i] == b[j]:
+            cap = min(n_a - i, n_b - j)
+            step = 1
+            same = 0
+            while step <= cap:
+                if a[i:i + step] != b[j:j + step]:
+                    break
+                same = step
+                if step == cap:
+                    break
+                step <<= 1
+            if same >= 2 and same < cap:
+                # 在 [same, min(step,cap)) 间精化边界
+                lo, hi = same, min(step, cap)
+                while lo + 1 < hi:
+                    mid = (lo + hi) >> 1
+                    if a[i:i + mid] == b[j:j + mid]:
+                        lo = mid
+                    else:
+                        hi = mid
+                same = lo
+            else:
+                # 小步长逐行（避免大量小切片）
+                same = 0
+                while i + same < n_a and j + same < n_b and \
+                        a[i + same] == b[j + same]:
+                    same += 1
+            emit("equal", i, i + same, j, j + same)
+            i += same
+            j += same
+        if i >= n_a and j >= n_b:
+            break
+        if i >= n_a:
+            emit("insert", i, i, j, n_b)
+            j = n_b
+            break
+        if j >= n_b:
+            emit("delete", i, n_a, j, j)
+            i = n_a
+            break
+
+        # 2) 失配：先尝试 O(1) 的常见小编辑快速路径
+        #    （单行 替换/删除/插入，后续必须能重新连续对上）。
+        RUN = 6
+        # a[i] 被替换为 b[j]
+        if (i + 1 < n_a and j + 1 < n_b and
+                a[i + 1:i + 1 + RUN] == b[j + 1:j + 1 + RUN]):
+            emit("replace", i, i + 1, j, j + 1)
+            i += 1
+            j += 1
+            continue
+        # a[i] 被删除（b[j] 对齐 a[i+1]）
+        if i + 1 < n_a and a[i + 1:i + 1 + RUN] == b[j:j + RUN]:
+            emit("delete", i, i + 1, j, j)
+            i += 1
+            continue
+        # 新插入 b[j]（a[i] 对齐 b[j+1]）
+        if j + 1 < n_b and a[i:i + RUN] == b[j + 1:j + 1 + RUN]:
+            emit("insert", i, i, j, j + 1)
+            j += 1
+            continue
+
+        # 3) 多行行级变更：倍增窗口，直到找到跨越差异后仍成立的再锚点
+        w = window
+        done = False
+        while w <= max_expand:
+            la, lb = a[i:i + w], b[j:j + w]
+            anchor = find_anchor(la, lb)
+            if anchor is not None:
+                ax, ay, asize = anchor
+                pre = difflib.SequenceMatcher(
+                    None, la[:ax], lb[:ay], autojunk=False).get_opcodes()
+                for tag, x1, x2, y1, y2 in pre:
+                    emit(tag, i + x1, i + x2, j + y1, j + y2)
+                emit("equal", i + ax, i + ax + asize, j + ay, j + ay + asize)
+                i += ax + asize
+                j += ay + asize
+                done = True
+                break
+            w *= 2
+
+        if not done:
+            # 大平移 / 重复行严重：剩余整体交给 patience
+            rest = patience_opcodes(a[i:], b[j:])
+            for tag, x1, x2, y1, y2 in rest:
+                emit(tag, i + x1, i + x2, j + y1, j + y2)
+            break
+
+    return _merge_replace(ops)
+
+
 def diff_text(text_a, text_b, method="auto"):
     """文本级入口：返回 (lines_a, lines_b, opcodes)。"""
     la, lb = split_lines(text_a), split_lines(text_b)

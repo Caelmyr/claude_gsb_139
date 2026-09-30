@@ -486,6 +486,18 @@ def api_version_history(ctx):
             "history": ctx.nn.versions.file_history(path, branch)}
 
 
+@route("GET", "/api/version/blame")
+def api_version_blame(ctx):
+    """逐行溯源：每行来自哪次提交/谁/何时，区分合并带入与直接修改。"""
+    path = ctx.query.get("path", "")
+    if not path:
+        raise ApiError(400, "缺少 path 参数")
+    ref = ctx.query.get("ref") or None          # 缺省 / WORKING = 活动文件
+    branch = ctx.query.get("branch") or None
+    mainline = max(1, min(ctx.q_int("mainline", 1), 2))
+    return ctx.nn.versions.blame(path, ref=ref, branch=branch, mainline=mainline)
+
+
 @route("POST", "/api/version/restore")
 def api_version_restore(ctx):
     body = ctx.json()

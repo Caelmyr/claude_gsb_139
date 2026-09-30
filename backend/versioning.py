@@ -33,7 +33,8 @@ versioning.py — 版本控制（提交 / 分支 / 合并 / 检出 / 差异）
 import threading
 
 from . import config
-from .diff_engine import diff_opcodes, diff_stats, merge3, split_lines
+from .diff_engine import (blame_opcodes, diff_opcodes, diff_stats, merge3,
+                          split_lines)
 from .util import (LRU, canonical_json, classify_merge_base, decode_text,
                    gen_id, is_text_mime, looks_binary, merge_label_swap,
                    now, sha256_bytes, sha256_text, short_hash, sort_by_ts)
@@ -795,6 +796,344 @@ class VersionStore:
                               f"从 {short_hash(c['id'], 8)} 恢复文件")
             return {"path": path, "inode": inode["id"],
                     "from_commit": c["id"]}
+
+    # ---------------------------------------------------------------- 逐行溯源
+    def blame(self, path, ref=None, branch=None, mainline=1):
+        """
+        逐行溯源（git blame 语义）：给出文件每一行最终由哪次提交引入、
+        作者与时间。
+
+        合并归属（关键）：自底向上扫描祖先 DAG，在双父合并提交处：
+          * 行在主线父（parent_ids[0]=本分支侧）中存在
+                                  -> 继承主线父的归属（本分支直接演进的内容）；
+          * 行只在被合入侧父中存在
+                                  -> 继承该父的归属，并打 merged_in=本次合并
+                                     （表示"合并带入"：作者仍是真正写它的人，
+                                     绝不记到执行合并者头上；另记录经哪次合并
+                                     进入本分支）；
+          * 行在所有父中都不存在 -> 合并解决冲突时新写，归属合并提交本身，
+                                     merged_in 不置位。
+
+        算法（git blame 的自底向上传播，扛大文件/多提交）：
+          祖先按拓扑序（父先于子）遍历，恰好一遍。为每个 (提交,该文件blob)
+          维护一份行归属数组，用 difflib opcodes 把父 blob 的行归属沿
+          equal 区传播到子 blob，新增/修改行归子提交。相同 blob 直接共享
+          归属数组（不触碰该文件的提交零成本）；opcodes 按哈希对缓存。
+          每对 (子blob,父blob) 至多计算一次差异。
+
+        返回：
+          {path, ref, branch, is_text, line_count, truncated, working_dirty,
+           commits:{id: brief+merge_info}, groups:[{commit,start,end,
+           merged_in, lines}]}
+        groups 与行严格一一对应：start 从 1 起、区间互不重叠且恰好覆盖 [1,n]。
+        """
+        with self.meta.lock:
+            v = self._v()
+            commits = v["commits"]
+
+            # 1) 起点：WORKING/缺省=活动文件（以 HEAD 为其父），否则取 ref 快照
+            working_dirty = False
+            virtual = None
+            if not ref or ref in ("WORKING", "working"):
+                head_id, _ = self.branch_head(branch)
+                start_cid = head_id
+                inode = self.nn.fs.resolve(path)
+                if inode is None or inode.get("type") != "file":
+                    raise VersionError(f"活动文件不存在: {path}")
+                entry = {
+                    "content_hash": inode.get("content_hash"),
+                    "block_ids": list(inode.get("block_ids", [])),
+                    "mime": inode.get("mime", ""),
+                    "size": inode.get("size", 0),
+                }
+                he = commits.get(start_cid, {}).get("snapshot", {}).get(path)
+                working_dirty = (not he or
+                                 he.get("content_hash") != entry["content_hash"])
+                if working_dirty:
+                    virtual = {
+                        "id": "WORKING",
+                        "parent_ids": [start_cid] if start_cid else [],
+                        "message": "未提交的工作区修改",
+                        "author": "working", "ts": now(),
+                        "stats": {}, "conflicts": [],
+                    }
+            else:
+                start = self.get_commit(ref)
+                start_cid = start["id"]
+                entry = start.get("snapshot", {}).get(path)
+                if not entry:
+                    raise VersionError(f"{ref} 中不存在文件: {path}")
+
+            # 2) 读内容并做文本/规模校验（行号以起点文件为准）
+            data = self.nn.read_blocks(entry.get("block_ids", []))
+            text = decode_text(data)
+            if text is None or looks_binary(data):
+                return {"path": path, "ref": ref or "WORKING",
+                        "branch": branch or v.get("head_branch"),
+                        "is_text": False, "line_count": 0, "groups": [],
+                        "commits": {}, "truncated": False,
+                        "working_dirty": working_dirty,
+                        "mime": entry.get("mime", ""),
+                        "size": entry.get("size", 0)}
+            start_lines = split_lines(text)
+            truncated = len(start_lines) > config.BLAME_MAX_LINES
+            if truncated:
+                start_lines = start_lines[:config.BLAME_MAX_LINES]
+            n = len(start_lines)
+
+            commits_eff = dict(commits)
+            if virtual is not None:
+                commits_eff["WORKING"] = virtual
+                start_cid = "WORKING"
+
+            # 3) 祖先闭包 + 拓扑序（父先于子）。祖先集合用现成 BFS，
+            #    排序用 ts 近似并以"父必须先于子"做稳定校正。
+            anchor = (start_cid if start_cid in commits
+                      else (commits_eff[start_cid]["parent_ids"][0]
+                            if commits_eff[start_cid]["parent_ids"] else None))
+            ancestor_ids = self.ancestors(
+                anchor, cap=config.BLAME_MAX_COMMITS + 1)
+            ancestor_ids.add(start_cid)
+            ordered = self._blame_topo(commits_eff, ancestor_ids)
+            cap_hit = len(ordered) > config.BLAME_MAX_COMMITS
+
+            # 4) 预取本文件的全部历史 blob（按 hash 去重，同块只读一次）
+            blob_lines = {}
+
+            def entry_of(cid):
+                if cid == start_cid and virtual is not None:
+                    return entry
+                return commits_eff.get(cid, {}).get("snapshot", {}).get(path)
+
+            to_load = {}
+            for cid in ordered:
+                e = entry_of(cid)
+                if e is not None and e.get("content_hash") not in to_load:
+                    to_load[e["content_hash"]] = e
+            for h, fe in to_load.items():
+                try:
+                    d = self.nn.read_blocks(fe.get("block_ids", []))
+                    tx = decode_text(d)
+                    ls = (split_lines(tx) if (tx is not None and not looks_binary(d))
+                          else None)
+                except Exception:
+                    ls = None
+                if ls is not None and len(ls) > config.BLAME_MAX_LINES:
+                    ls = ls[:config.BLAME_MAX_LINES]
+                blob_lines[h] = ls
+            blob_lines[entry.get("content_hash")] = start_lines
+
+            ops_cache = {}   # (子 hash, 父 hash) -> opcodes
+
+            def opcodes(child_h, child_ls, par_h, par_ls):
+                key = (child_h, par_h)
+                ops = ops_cache.get(key)
+                if ops is None:
+                    # 溯源专用对齐：失配处只在小窗口内跑 difflib（每次提交
+                    # 通常只改少量行），大平移自动退回 patience。既快又与
+                    # 全文 difflib 的 equal 行集合一致。
+                    ops = blame_opcodes(child_ls, par_ls)
+                    ops_cache[key] = ops
+                return ops
+
+            # 5) 自底向上传播归属。归属按"提交"存（同内容 blob 在不同合并
+            #    路径上可能带不同 merged_in，不能只按 blob 共享）：
+            #    owners_by_commit[cid] = 每行 (归属提交 id, 经哪次合并进入)。
+            #    非合并提交若与某父 blob 相同，直接浅拷贝父归属（零成本）。
+            owners_by_commit = {}
+
+            def seed_owner(length, cid, via=None):
+                return [(cid, via)] * length
+
+            def inherit(src_owner, add_via):
+                if add_via is None:
+                    return list(src_owner)
+                return [(w, (old or add_via)) for (w, old) in src_owner]
+
+            for cid in ordered:
+                e = entry_of(cid)
+                c = commits_eff[cid]
+                parents = [p for p in c.get("parent_ids", [])
+                           if p in commits_eff and p in ancestor_ids]
+                if e is None:
+                    continue                              # 该提交中文件不存在
+                ch = e.get("content_hash")
+                cls_ = blob_lines.get(ch)
+
+                if cls_ is None:
+                    owners_by_commit[cid] = seed_owner(0, cid)
+                    continue
+                if not parents:
+                    owners_by_commit[cid] = seed_owner(len(cls_), cid)
+                    continue
+
+                # 可用父（含本文件 blob）：mainline 父优先，其余为侧父
+                ml = max(0, min(mainline - 1, len(parents) - 1))
+                mainline_pid = parents[ml]
+                par_order = ([parents[ml]] +
+                             [p for k, p in enumerate(parents) if k != ml])
+                usable = []
+                for pid in par_order:
+                    pe = entry_of(pid)
+                    if pe is None:
+                        continue
+                    ph = pe.get("content_hash")
+                    pls_ = blob_lines.get(ph)
+                    if pls_ is None:
+                        continue
+                    usable.append((pid, ph, pls_, pid == mainline_pid))
+                if not usable:
+                    owners_by_commit[cid] = seed_owner(len(cls_), cid)
+                    continue
+
+                pid0, ph0, pls0, is_main0 = usable[0]
+                base0 = owners_by_commit.get(pid0)
+                is_merge = len(parents) > 1
+                # 内容与基准父完全一致：直接继承；若基准父是侧父
+                # （主线父整个没这文件 => 侧分支新增文件经合并整体带入），
+                # 或本提交是合并，都要保证带上本次合并标记。
+                if ch == ph0 and base0 is not None and len(base0) == len(cls_):
+                    add_via = cid if (is_merge and not is_main0) else None
+                    owners_by_commit[cid] = inherit(base0, add_via)
+                    continue
+
+                if len(cls_) + len(pls0) > config.BLAME_DIFF_LINES_LIMIT:
+                    cap_hit = True
+                    owners_by_commit[cid] = seed_owner(len(cls_), cid)
+                    continue
+
+                # 基准父沿 equal 区传播（整段切片拷贝，C 层完成）；
+                # 非 equal 行留 None，稍后批量定案为本提交新增。
+                owner = [None] * len(cls_)
+                ops = opcodes(ch, cls_, ph0, pls0)
+                if base0 is not None:
+                    for tag, i1, i2, j1, j2 in ops:
+                        if tag == "equal":
+                            owner[i1:i2] = base0[j1:j2]
+
+                # 合并提交：基准父对不上的行，依次尝试侧父；命中标 merged_in
+                if is_merge:
+                    for pid, ph, pls, _is_main in usable[1:]:
+                        side = owners_by_commit.get(pid)
+                        if side is None or ch == ph or \
+                                not any(o is None for o in owner):
+                            continue
+                        if len(cls_) + len(pls) > config.BLAME_DIFF_LINES_LIMIT:
+                            cap_hit = True
+                            continue
+                        sops = opcodes(ch, cls_, ph, pls)
+                        for tag, i1, i2, j1, j2 in sops:
+                            if tag != "equal":
+                                continue
+                            for k in range(i1, i2):
+                                if owner[k] is None:
+                                    w, old = side[j1 + (k - i1)]
+                                    owner[k] = (w, old or cid)
+                # 无来源的行 = 本提交新增（直接修改 / 冲突解决新写）
+                new_marks = (cid, None)
+                owner = [o if o is not None else new_marks for o in owner]
+                owners_by_commit[cid] = owner
+
+            final_owner = owners_by_commit.get(start_cid)
+            if final_owner is None or len(final_owner) != n:
+                # 极端兜底（blob 缺失等）：全部归起点提交
+                final_owner = [(start_cid, None)] * n
+                cap_hit = True
+            return self._blame_finalize(
+                path, entry, start_lines, final_owner, commits_eff, ref,
+                branch, working_dirty, truncated or cap_hit, mainline)
+
+    @staticmethod
+    def _blame_topo(commits, ids):
+        """
+        祖先闭包的拓扑序：父先于子。ts 相同时用 id 兜底；并保证每条
+        父子边的父排在子前（必要时做拓扑校正），避免归属数组尚未生成。
+        """
+        ids = set(ids)
+        nodes = [(commits[c].get("ts", 0), c) for c in ids if c in commits]
+        nodes.sort(key=lambda x: (x[0], x[1]))
+        order = [c for _ts, c in nodes]
+        pos = {c: i for i, c in enumerate(order)}
+        # Kahn 式修正：只要存在 父在子后，就把父前插。闭包规模通常有限。
+        changed = True
+        guard = 0
+        while changed and guard < 4:
+            changed = False
+            guard += 1
+            for c in order:
+                for p in commits[c].get("parent_ids", []):
+                    if p in pos and pos[p] > pos[c]:
+                        order.remove(p)
+                        ci = order.index(c)
+                        order.insert(ci, p)
+                        pos = {x: i for i, x in enumerate(order)}
+                        changed = True
+        return order
+
+    def _blame_finalize(self, path, entry, lines, owner, commits_eff, ref,
+                        branch, working_dirty, truncated, mainline):
+        """把逐行归属压成连续组，并附上提交摘要（含合并信息）。"""
+        n = len(lines)
+        for i in range(n):                       # 兜底：每行必须定案
+            if owner[i] is None:
+                owner[i] = ("UNKNOWN", None)
+
+        commit_ids, merge_ids = set(), set()
+        for cid, via in owner:
+            commit_ids.add(cid)
+            if via:
+                merge_ids.add(via)
+
+        def brief(cid):
+            c = commits_eff.get(cid) or {}
+            if cid == "WORKING":
+                b = {"id": "WORKING", "short": "WORKING", "parent_ids": [],
+                     "parents_short": [], "message": "未提交的工作区修改",
+                     "author": "working", "ts": now(), "stats": {}, "refs": [],
+                     "is_merge": False, "conflicts": [], "tree_hash": ""}
+            else:
+                b = self.commit_brief(c)
+            mi = c.get("merge_info")
+            if mi:
+                b = dict(b)
+                b["merge_info"] = {
+                    "source": mi.get("source"), "target": mi.get("target"),
+                    "base": short_hash(mi.get("base") or "", 8),
+                    "clean": mi.get("clean", True)}
+            return b
+
+        commit_map = {cid: brief(cid) for cid in commit_ids | merge_ids}
+
+        groups = []
+        i = 0
+        while i < n:
+            cid, via = owner[i]
+            j = i + 1
+            while j < n and owner[j] == (cid, via):
+                j += 1
+            groups.append({
+                "commit": cid,
+                "merged_in": via if via and via != cid else None,
+                "start": i + 1,                  # 1 基、闭区间
+                "end": j,
+                "lines": lines[i:j],
+            })
+            i = j
+
+        return {
+            "path": path,
+            "ref": ref or "WORKING",
+            "branch": branch or self._v().get("head_branch"),
+            "mainline": mainline,
+            "is_text": True,
+            "mime": entry.get("mime", ""),
+            "size": entry.get("size", 0),
+            "line_count": n,
+            "truncated": truncated,
+            "working_dirty": working_dirty,
+            "commits": commit_map,
+            "groups": groups,
+        }
 
     # ---------------------------------------------------------------- 图
     def graph(self, branch=None, limit=60):
