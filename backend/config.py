@@ -129,6 +129,10 @@ DIFF_METHOD = "auto"                    # auto | myers | patience
 DIFF_MYERS_CELL_LIMIT = 40_000_000      # Myers 轨迹内存保护阈值（超过转 patience）
 DIFF_MAX_LINES = 400_000                # 单次 diff 行数上限
 DIFF_CONTEXT_DEFAULT = 3
+BLAME_MAX_TEXT_BYTES = 8 * 1024 * 1024  # 逐行溯源单文件大小上限
+BLAME_MAX_LINES = 200_000               # 逐行溯源单文件行数上限
+BLAME_ROW_PAGE = 500                    # 前端虚拟滚动默认每次取行数
+BLAME_ROW_PAGE_MAX = 2_000
 
 # ----------------------------------------------------------------------------
 # 版本控制（难点三：版本树冲突合并）

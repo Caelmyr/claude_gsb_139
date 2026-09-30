@@ -477,6 +477,29 @@ def api_version_file_at(ctx):
     return ctx.nn.versions.file_at(ref, path)
 
 
+@route("GET", "/api/version/commit")
+def api_version_commit_detail(ctx):
+    ref = ctx.query.get("ref", "HEAD")
+    c = ctx.nn.versions.get_commit(ref)
+    parent = c.get("parent_ids", [""])[0]
+    return {"commit": ctx.nn.versions.commit_brief(c),
+            "parent": parent,
+            "diff": ctx.nn.versions.diff_refs(parent, c["id"])}
+
+
+@route("GET", "/api/version/blame")
+def api_version_blame(ctx):
+    path = ctx.query.get("path", "")
+    ref = ctx.query.get("ref") or "HEAD"
+    working = ctx.query.get("working", "").lower() in ("1", "true", "yes")
+    if working or ref.upper() == "WORKING":
+        ref = "WORKING"
+        working = True
+    start = max(ctx.q_int("start", 0), 0)
+    limit = ctx.q_int("limit", config.BLAME_ROW_PAGE)
+    return ctx.nn.versions.blame_file(path, ref, start, limit, working)
+
+
 @route("GET", "/api/version/history")
 def api_version_history(ctx):
     path = ctx.query.get("path", "")

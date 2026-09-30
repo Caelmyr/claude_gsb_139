@@ -204,6 +204,7 @@ const DFSVS = (() => {
     ]},
     { group: "版本", items: [
       { href: "versions.html", ico: "⑂", name: "版本历史" },
+      { href: "blame.html", ico: "☷", name: "逐行溯源" },
       { href: "diff.html", ico: "±", name: "差异对比" },
     ]},
     { group: "集群", items: [

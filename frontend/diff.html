@@ -77,6 +77,7 @@
           <div class="side grow">
             <div class="card">
               <div class="card-title"><span id="ld-title">行级差异</span></div>
+              <div id="ld-commit" class="trace-box" style="display:none;margin-bottom:10px"></div>
               <div class="perf-box" id="ld-perf" style="display:none"></div>
               <div id="ld-body"><div class="empty"><div class="big">±</div>选择左侧文件查看行级差异</div></div>
             </div>
@@ -143,7 +144,7 @@
 <script src="js/app.js"></script>
 <script>
 "use strict";
-const { api, esc, fmtBytes, toast } = DFSVS;
+const { api, esc, fmtBytes, fmtTs, fmtAgo, toast } = DFSVS;
 
 // ------------------------------------------------------------------ 页签
 document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
@@ -244,8 +245,35 @@ async function showLineDiff(path, a, b) {
     renderPerf("ld-perf", r.timing, r.label_a, r.label_b);
     body.innerHTML = document.getElementById("opt-view").value === "split"
       ? renderSplit(r.split) : renderUnified(r.unified);
+    showCommitBanner(b === "WORKING" ? "" : b, DFSVS.qs("via"));
   } catch (e) {
     body.innerHTML = `<div class="empty small">${esc(e.message)}</div>`;
+  }
+}
+
+async function showCommitBanner(commitId, viaId) {
+  const box = document.getElementById("ld-commit");
+  if (!commitId || commitId === "WORKING") { box.style.display = "none"; box.innerHTML = ""; return; }
+  try {
+    const [c, via] = await Promise.all([
+      api("GET", `/api/version/commit?ref=${encodeURIComponent(commitId)}`),
+      viaId ? api("GET", `/api/version/commit?ref=${encodeURIComponent(viaId)}`) : Promise.resolve(null),
+    ]);
+    const x = c.commit;
+    box.style.display = "";
+    box.innerHTML = `
+      <div class="step">
+        <span class="chip">${esc(x.short)}</span>
+        ${x.is_merge ? '<span class="badge violet plain">merge</span>' : ""}
+        <b>${esc(x.message)}</b>
+      </div>
+      <div class="step small muted">${esc(x.author)} · ${fmtTs(x.ts)}（${fmtAgo(x.ts)}）
+        · 父提交 ${esc(c.parent ? c.parent.slice(0, 12) : "（根提交）")}</div>
+      ${via ? `<div class="step" style="color:#c59bff">⇄ 该行由合并提交
+        <b>${esc(via.commit.short)}</b> 带入；下面显示的是来源行在原始提交
+        <b>${esc(x.short)}</b> 中的改动，作者不会记为合并操作者 ${esc(via.commit.author)}。</div>` : ""}`;
+  } catch (e) {
+    box.style.display = "none";
   }
 }
 

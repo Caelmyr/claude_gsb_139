@@ -49,6 +49,9 @@ class VersionStore:
         self.meta = nn.meta
         self.lock = threading.RLock()
         self._diff_cache = LRU(maxsize=128)
+        self._blame_cache = LRU(maxsize=4)
+        self._blame_text_cache = LRU(maxsize=16, max_bytes=32 * 1024 * 1024)
+        self._blame_op_cache = LRU(maxsize=256, max_bytes=16 * 1024 * 1024)
 
     # ---------------------------------------------------------------- 基础
     def _v(self):
@@ -486,6 +489,264 @@ class VersionStore:
                 if len(out) >= limit:
                     break
             return out
+
+    # --------------------------------------------------------------- 逐行溯源
+    def blame_file(self, path, ref="HEAD", start=0, limit=None, working=False):
+        """
+        返回文件每行的原始提交。
+
+        合并提交按 Git 的 first-parent 口径处理：只与第一父逐行比对；在其它
+        父提交中匹配到的行仍归真实作者所有，同时用 via_merge 标记它是由该
+        merge 带入本分支，而不是记到 merge 提交作者名下。
+        """
+        limit = min(max(int(limit or config.BLAME_ROW_PAGE), 1),
+                    config.BLAME_ROW_PAGE_MAX)
+        with self.meta.lock:
+            if working:
+                target = None
+                target_entry = self.nn.fs.resolve(path)
+                if target_entry.get("type") != "file":
+                    raise VersionError(f"文件不存在: {path}")
+                mime = target_entry.get("mime", "")
+                size = target_entry.get("size", 0)
+                block_ids = list(target_entry.get("block_ids", []))
+            else:
+                target = self.get_commit(ref or "HEAD")
+                target_entry = target.get("snapshot", {}).get(path)
+                if not target_entry:
+                    raise VersionError(f"{ref or 'HEAD'} 中不存在文件: {path}")
+                mime = target_entry.get("mime", "")
+                size = target_entry.get("size", 0)
+                block_ids = list(target_entry.get("block_ids", []))
+
+        if not is_text_mime(mime):
+            raise VersionError("仅支持文本文件的逐行溯源")
+        if size > config.BLAME_MAX_TEXT_BYTES:
+            raise VersionError("文件过大，超出逐行溯源上限")
+        lines = self._blame_text_lines(
+            (target or {}).get("id", "WORKING"),
+            target_entry.get("content_hash"), block_ids)
+        if len(lines) > config.BLAME_MAX_LINES:
+            raise VersionError("文件行数过多，超出逐行溯源上限")
+
+        cache_key = None if target is None else (path, target["id"])
+        blame = None if cache_key is None else self._blame_cache.get(cache_key)
+        if blame is None or blame.get("line_count") != len(lines):
+            blame = self._compute_blame(path, target, target_entry, lines)
+            if cache_key is not None:
+                self._blame_cache.put(cache_key, blame)
+
+        start = max(int(start), 0)
+        if start >= len(lines):
+            start = max(len(lines) - 1, 0)
+        end = min(start + limit, len(lines))
+        rows = [self._blame_row(blame, i, lines[i], i >= start and i < end)
+                for i in range(start, end)]
+        out = {k: v for k, v in blame.items()
+               if k not in ("origins", "vias")}
+        out.update({"path": path, "start": start, "end": end,
+                    "rows": rows, "has_more": end < len(lines)})
+        return out
+
+    def _blame_text_lines(self, version_id, content_hash, block_ids):
+        key = content_hash
+        cached = self._blame_text_cache.get(key)
+        if cached is not None:
+            return cached
+        data = self.nn.read_blocks(block_ids)
+        text = decode_text(data)
+        if text is None or looks_binary(data):
+            raise VersionError("二进制文件不支持逐行溯源")
+        lines = text.splitlines()
+        self._blame_text_cache.put(key, lines)
+        return lines
+
+    def _compute_blame(self, path, target, target_entry, target_lines):
+        with self.meta.lock:
+            v = self._v()
+            commits = v["commits"]
+            head_id = (target or {}).get("id")
+            head_pid, _ = self.branch_head()
+
+            commit_index = {}
+            commit_list = []
+            via_map = {}
+
+            def brief_for(commit):
+                if commit["id"] == "WORKING":
+                    return {"id": "WORKING", "short": "WORKING",
+                            "parent_ids": [head_pid] if head_pid else [],
+                            "parents_short": [], "message": "工作区未提交修改",
+                            "author": "(working)", "ts": now(), "stats": {},
+                            "refs": [], "is_merge": False,
+                            "conflicts": [], "tree_hash": ""}
+                return self.commit_brief(commit)
+
+            def cidx_for(commit):
+                cid = commit["id"]
+                if cid not in commit_index:
+                    commit_index[cid] = len(commit_list)
+                    commit_list.append(brief_for(commit))
+                return commit_index[cid]
+
+            origins = [-1] * len(target_lines)
+            vias = [-1] * len(target_lines)
+
+            def assign_range(targets, commit, via_idx):
+                ci = cidx_for(commit)
+                for ti in targets:
+                    origins[ti] = ci
+                    vias[ti] = via_idx
+
+            def parent_list(commit):
+                if commit["id"] == "WORKING":
+                    return [commits[head_pid]] if head_pid else []
+                return [commits.get(pid)
+                        for pid in commit.get("parent_ids", [])
+                        if commits.get(pid)]
+
+            def parent_entry(commit):
+                return commit.get("snapshot", {}).get(path)
+
+            def parent_lines(commit):
+                entry = parent_entry(commit)
+                if not entry:
+                    return None
+                return self._blame_text_lines(
+                    commit["id"], entry.get("content_hash"),
+                    entry.get("block_ids", []))
+
+            # DFS 工作项：(当前提交, 当前行文本, 这些行对应的最终行号,
+            # 进入当前提交所经过的 merge commit，-1 表示本分支第一父链)
+            head_commit = commits.get(head_id) if head_id else {"id": "WORKING"}
+            stack = [(head_commit, target_lines,
+                      list(range(len(target_lines))), -1,
+                      target_entry.get("content_hash"))]
+
+            while stack:
+                commit, lines, targets, via_idx, seg_hash = stack.pop()
+                parents = parent_list(commit)
+                if not parents:
+                    assign_range(targets, commit, via_idx)
+                    continue
+
+                parent_files = [(pi, pc, parent_entry(pc), parent_lines(pc))
+                                for pi, pc in enumerate(parents)]
+                equal_parents = [(pi, pc, plines)
+                                 for pi, pc, entry, plines in parent_files
+                                 if plines is not None and (
+                                     (seg_hash and entry.get("content_hash") == seg_hash)
+                                     or plines == lines)]
+                if equal_parents:
+                    # 跳过没有修改该段的中间提交；跨分支时记录进入点 merge。
+                    if via_idx < 0:
+                        first_equal = next((x for x in equal_parents
+                                            if x[0] == 0), equal_parents[0])
+                    else:
+                        first_equal = equal_parents[0]
+                    pi, pc, plines = first_equal
+                    child_via = via_idx
+                    if child_via < 0 and pi > 0:
+                        child_via = cidx_for(commit)
+                    next_hash = seg_hash if (
+                        seg_hash and parent_entry(pc).get("content_hash") == seg_hash
+                    ) else None
+                    stack.append((pc, plines, targets, child_via, next_hash))
+                    continue
+
+                # 每个父只拿到仍由该父负责的最终槽位；第一父优先，
+                # 因此本分支直接修改不会被误标成合并带入。
+                remaining = list(zip(lines, targets))
+                for pi, parent in enumerate(parents):
+                    if not remaining:
+                        break
+                    plines = parent_lines(parent)
+                    if plines is None:
+                        continue
+
+                    child_via = via_idx
+                    if child_via < 0 and pi > 0:
+                        child_via = cidx_for(commit)
+
+                    if [x[0] for x in remaining] == plines:
+                        matched = remaining
+                        remaining = []
+                    else:
+                        rem_lines = [x[0] for x in remaining]
+                        rem_targets = [x[1] for x in remaining]
+                        ops = self._blame_ops(rem_lines, plines)
+                        matched, unmatched = [], []
+                        for tag, i1, i2, j1, j2 in ops:
+                            seg_t = rem_targets[i1:i2]
+                            if tag == "equal":
+                                for local, text in enumerate(plines[j1:j2]):
+                                    matched.append((text, seg_t[local]))
+                            else:
+                                unmatched.extend(
+                                    zip(rem_lines[i1:i2], seg_t))
+                        remaining = unmatched
+
+                    if not matched:
+                        continue
+                    matched_text = [text for text, _ti in matched]
+                    matched_targets = [ti for _text, ti in matched]
+                    assign_range(matched_targets, parent, child_via)
+
+                    # 若父文件与该段完全一致，继续沿其历史追溯；第一父链上
+                    # 内容未改的 merge 不会成为行的来源，只保留真正改行的提交。
+                    next_hash = None
+                    parent_entry_obj = parent_entry(parent)
+                    if parent_entry_obj and len(matched_text) == len(plines):
+                        next_hash = parent_entry_obj.get("content_hash")
+                    stack.append((parent, matched_text,
+                                  matched_targets, child_via, next_hash))
+
+                if remaining:
+                    assign_range([ti for _text, ti in remaining],
+                                 commit, via_idx)
+
+            for c in commit_list:
+                if c.get("is_merge"):
+                    mc = commits.get(c["id"], {})
+                    info = mc.get("merge_info", {})
+                    via_map[str(commit_index[c["id"]])] = {
+                        "commit": c,
+                        "source": info.get("source"),
+                        "target": info.get("target"),
+                        "base": short_hash(info.get("base", ""), 8),
+                    }
+
+        return {"ref": head_id or "WORKING",
+                "commit_id": head_id,
+                "line_count": len(target_lines),
+                "size": target_entry.get("size", 0),
+                "mime": target_entry.get("mime", ""),
+                "commits": commit_list,
+                "via_merges": via_map,
+                "origins": origins,
+                "vias": vias}
+
+    def _blame_ops(self, a_lines, b_lines):
+        if not a_lines or not b_lines:
+            return [] if not a_lines and not b_lines else [
+                ("insert" if not a_lines else "delete",
+                 0, len(a_lines), 0, len(b_lines))]
+        key = (sha256_text("\n".join(a_lines)), sha256_text("\n".join(b_lines)))
+        ops = self._blame_op_cache.get(key)
+        if ops is None:
+            ops = [list(op) for op in diff_opcodes(a_lines, b_lines)]
+            self._blame_op_cache.put(key, ops)
+        return ops
+
+    def _blame_row(self, blame, line_no, text, include_text=True):
+        ci = blame["origins"][line_no]
+        vi = blame["vias"][line_no]
+        row = {"line": line_no + 1,
+               "commit_idx": ci,
+               "via_merge_idx": vi if vi >= 0 else None}
+        if include_text:
+            row["text"] = text
+        return row
 
     # ---------------------------------------------------------------- 合并
     def merge(self, source_ref, target_branch=None, author="admin"):

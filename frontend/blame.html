@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>逐行溯源 · DFSVS</title>
+<link rel="stylesheet" href="css/app.css">
+<style>
+  :root { --blame-row-h: 24px; }
+  .blame-toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .blame-wrap {
+    margin-top:12px; border:1px solid var(--border-soft); border-radius:10px;
+    background:#0d111a; overflow:auto; height:calc(100vh - 206px); min-height:360px;
+    position:relative; font-family:var(--mono); font-size:12.5px;
+  }
+  .blame-head, .blame-row {
+    display:grid; grid-template-columns:74px 230px max-content;
+    height:var(--blame-row-h); width:max-content; min-width:100%;
+    align-items:stretch;
+  }
+  .blame-head {
+    position:sticky; top:0; z-index:5; background:#151b27; color:var(--muted);
+    border-bottom:1px solid var(--border); font-size:11.5px;
+  }
+  .blame-head > div { padding:4px 10px; border-right:1px solid var(--border-soft); }
+  .blame-canvas { position:relative; }
+  .blame-row { border-bottom:1px solid rgba(255,255,255,.025); cursor:pointer; }
+  .blame-row:hover { filter:brightness(1.18); }
+  .blame-row.selected { outline:2px solid var(--accent); outline-offset:-2px; z-index:2; }
+  .blame-ln {
+    color:#7e889d; text-align:right; padding:0 10px 0 8px; line-height:var(--blame-row-h);
+    user-select:none; border-right:1px solid var(--border-soft);
+  }
+  .blame-meta {
+    padding:0 10px; line-height:var(--blame-row-h); white-space:nowrap; overflow:hidden;
+    display:flex; gap:6px; align-items:center; border-right:1px solid var(--border-soft);
+  }
+  .blame-code {
+    white-space:pre; line-height:var(--blame-row-h); padding:0 14px;
+    color:#d8e1f2; overflow:hidden;
+  }
+  .blame-meta .commit-link { color:inherit; overflow:hidden; text-overflow:ellipsis; }
+  .blame-meta .author { color:#9fa9bd; font-family:var(--sans); font-size:11px; }
+  .merge-mark { color:#c59bff; font-weight:700; flex:none; }
+  .blame-loading {
+    position:sticky; left:0; right:0; padding:18px; text-align:center;
+    color:var(--muted); font-family:var(--sans);
+  }
+  .commit-pop { max-width:780px; }
+  .commit-pop .commit-head { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  .commit-pop .commit-msg { font-size:16px; font-weight:650; margin:6px 0; }
+  .commit-pop .chg-row { cursor:pointer; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar" class="sidebar"></aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">逐行溯源</h1>
+        <div class="sub" id="page-sub">每一行的原始提交 · 作者 · 时间；合并带入不记到本分支作者</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="userchip" id="userchip"></div>
+    </header>
+
+    <section class="content">
+      <div class="card">
+        <div class="blame-toolbar">
+          <label class="fl">文件路径
+            <input id="path" style="min-width:360px" placeholder="/docs/readme.md"></label>
+          <label class="fl">版本
+            <select id="ref" style="min-width:220px"></select></label>
+          <button class="btn primary" id="run">开始溯源</button>
+          <span class="spacer" style="flex:1"></span>
+          <span class="hint" id="summary"></span>
+        </div>
+        <div class="small muted" style="margin-top:8px">
+          点击任意行查看其<b>原始提交详情与差异</b>；紫色 ⇄ 表示该行由跨分支合并带入，作者仍归来源提交。
+          列表使用虚拟滚动，只渲染可视窗口，大文件也不会错行。
+        </div>
+      </div>
+
+      <div class="blame-wrap" id="blameWrap">
+        <div class="blame-head">
+          <div>行号</div><div>提交 / 作者 / 时间</div><div>内容</div>
+        </div>
+        <div class="blame-canvas" id="canvas"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toasts"></div>
+<script src="js/app.js"></script>
+<script>
+"use strict";
+const { api, esc, fmtAgo, fmtBytes, toast } = DFSVS;
+
+const ROW_H = 24, PAGE = 500, OVERSCAN = 24;
+const PALETTE = ["#4f8cff", "#9b6cff", "#2fbf71", "#f0a538", "#39bcd0", "#f26ca7", "#5fb878", "#e07a5f"];
+let refs = [{ value: "WORKING", label: "★ WORKING（活动文件区）" }];
+let state = {
+  path: DFSVS.qs("path", ""), ref: DFSVS.qs("ref", "WORKING"),
+  total: 0, commits: [], viaMerges: {}, chunks: new Map(),
+  loading: new Set(), selected: null, req: 0
+};
+
+const pathEl = document.getElementById("path");
+const refEl = document.getElementById("ref");
+const wrap = document.getElementById("blameWrap");
+const canvas = document.getElementById("canvas");
+
+async function loadRefs() {
+  const [brs, commits] = await Promise.all([
+    api("GET", "/api/version/branches"),
+    api("GET", "/api/version/commits?limit=200"),
+  ]);
+  refs = [{ value: "WORKING", label: "★ WORKING（活动文件区）" }];
+  brs.branches.forEach(b => refs.push({ value: b.name, label: `⑂ ${b.name}（${b.head_short}）` }));
+  commits.commits.forEach(c => refs.push({ value: c.id, label: `· ${c.short} ${c.message.slice(0, 32)}` }));
+  refEl.innerHTML = refs.map(r => `<option value="${esc(r.value)}">${esc(r.label)}</option>`).join("");
+  refEl.value = state.ref || "WORKING";
+}
+
+function resetView(total) {
+  state.total = total;
+  state.chunks = new Map();
+  state.loading = new Set();
+  state.selected = null;
+  canvas.style.height = (total * ROW_H) + "px";
+  canvas.innerHTML = "";
+  render();
+}
+
+async function fetchChunk(start) {
+  const req = state.req;
+  const key = String(start);
+  if (state.loading.has(key)) return;
+  state.loading.add(key);
+  try {
+    const qs = new URLSearchParams({
+      path: state.path, start: String(start), limit: String(PAGE),
+    });
+    if (state.ref === "WORKING") qs.set("working", "1");
+    else qs.set("ref", state.ref);
+    const d = await api("GET", "/api/version/blame?" + qs.toString());
+    if (req !== state.req) return;
+    state.commits = d.commits;
+    state.viaMerges = d.via_merges || {};
+    state.total = d.line_count;
+    state.size = d.size;
+    state.mime = d.mime;
+    state.chunks.set(start, d.rows);
+    canvas.style.height = (state.total * ROW_H) + "px";
+    document.getElementById("summary").textContent =
+      `${state.total.toLocaleString()} 行 · ${fmtBytes(state.size)} · ${state.commits.length} 个相关提交`;
+    render();
+  } catch (e) {
+    if (req === state.req) toast(e.message, "bad");
+  } finally {
+    state.loading.delete(key);
+  }
+}
+
+function rowAt(i) {
+  const start = Math.floor(i / PAGE) * PAGE;
+  const rows = state.chunks.get(start);
+  return rows ? rows[i - start] : null;
+}
+
+function ensureChunksFor(first, last) {
+  const firstStart = Math.max(0, Math.floor((first - OVERSCAN) / PAGE) * PAGE);
+  const lastStart = Math.floor((last + OVERSCAN) / PAGE) * PAGE;
+  for (let s = firstStart; s <= lastStart && s < state.total; s += PAGE) {
+    if (!state.chunks.has(s)) fetchChunk(s);
+  }
+}
+
+function render() {
+  if (!state.total) return;
+  const scrollTop = wrap.scrollTop;
+  const first = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
+  const last = Math.min(state.total - 1,
+    Math.ceil((scrollTop + wrap.clientHeight) / ROW_H) + OVERSCAN);
+  ensureChunksFor(first, last);
+
+  const wanted = new Set();
+  for (let i = first; i <= last; i++) wanted.add(i);
+  canvas.querySelectorAll(".blame-row").forEach(el => {
+    const i = +el.dataset.i;
+    if (!wanted.has(i)) el.remove();
+  });
+
+  for (let i = first; i <= last; i++) {
+    const r = rowAt(i);
+    if (!r) continue;
+    let el = canvas.querySelector(`[data-i="${i}"]`);
+    if (!el) {
+      el = document.createElement("div");
+      el.dataset.i = String(i);
+      el.className = "blame-row";
+      canvas.appendChild(el);
+    }
+    el.style.position = "absolute";
+    el.style.left = "0";
+    el.style.top = (i * ROW_H) + "px";
+    if (state.selected === i) el.classList.add("selected");
+    else el.classList.remove("selected");
+    el.innerHTML = rowHtml(r);
+  }
+}
+
+function rowHtml(r) {
+  const c = state.commits[r.commit_idx] || {};
+  const color = PALETTE[r.commit_idx % PALETTE.length];
+  const via = r.via_merge_idx === null ? null : state.viaMerges[String(r.via_merge_idx)];
+  const time = c.ts ? fmtAgo(c.ts) : "";
+  return `
+    <div class="blame-ln">${r.line}</div>
+    <div class="blame-meta" style="background:${color}1f">
+      ${via ? `<span class="merge-mark" title="由合并 ${esc(via.commit?.short || "")} 带入：${esc(via.source || "")} → ${esc(via.target || "")}">⇄</span>` : ""}
+      <span class="commit-link" style="color:${color}">${esc(c.short || "-")}</span>
+      <span class="author">${esc(c.author || "")}</span>
+      <span class="author">${esc(time)}</span>
+    </div>
+    <div class="blame-code" style="background:${color}0d">${esc(r.text)}</div>`;
+}
+
+canvas.addEventListener("click", (e) => {
+  const el = e.target.closest(".blame-row");
+  if (!el) return;
+  const i = +el.dataset.i;
+  const r = rowAt(i);
+  if (!r) return;
+  state.selected = i;
+  render();
+  const c = state.commits[r.commit_idx];
+  if (!c || c.id === "WORKING") {
+    toast("这一行还没有提交；提交后才能查看提交详情与差异", "warn");
+    return;
+  }
+  const parent = c.parent_ids && c.parent_ids.length ? c.parent_ids[0] : "";
+  const via = r.via_merge_idx === null ? null : state.viaMerges[String(r.via_merge_idx)];
+  const viaQ = via ? `&via=${encodeURIComponent(via.commit.id)}` : "";
+  location.href = `diff.html?a=${encodeURIComponent(parent)}&b=${encodeURIComponent(c.id)}&path=${encodeURIComponent(state.path)}${viaQ}`;
+});
+
+async function run() {
+  state.path = pathEl.value.trim();
+  state.ref = refEl.value || "WORKING";
+  if (!state.path) return toast("请输入文件路径", "warn");
+  state.req++;
+  resetView(1);
+  canvas.innerHTML = `<div class="blame-loading">正在沿提交 DAG 计算逐行来源 …</div>`;
+  await fetchChunk(0);
+}
+
+document.getElementById("run").onclick = run;
+pathEl.onkeydown = e => { if (e.key === "Enter") run(); };
+refEl.onchange = () => { if (state.path) run(); };
+wrap.addEventListener("scroll", render, { passive: true });
+
+initPage("blame.html", "逐行溯源").then(async () => {
+  await loadRefs();
+  pathEl.value = state.path;
+  refEl.value = state.ref;
+  if (state.path) run();
+  else canvas.innerHTML = `<div class="blame-loading">输入文件路径并选择版本后开始溯源</div>`;
+});
+</script>
+</body>
+</html>

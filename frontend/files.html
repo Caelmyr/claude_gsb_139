@@ -208,6 +208,7 @@ async function selectEntry(it) {
             <button class="btn sm primary" id="d-preview">👁 预览</button>
             <button class="btn sm" id="d-download">⇩ 下载</button>
             <button class="btn sm" id="d-rename">✎ 重命名</button>
+            <button class="btn sm" id="d-blame">☷ 逐行溯源</button>
             <button class="btn sm" id="d-history">⑂ 版本历史</button>
             <button class="btn sm danger" id="d-delete">🗑 删除</button>
           </div>
@@ -238,6 +239,8 @@ async function selectEntry(it) {
     document.getElementById("d-download").onclick = () =>
       location.href = DFSVS.downloadUrl(s.path);
     document.getElementById("d-rename").onclick = () => renameEntry(s);
+    document.getElementById("d-blame").onclick = () =>
+      location.href = "blame.html?path=" + encodeURIComponent(s.path);
     document.getElementById("d-delete").onclick = () => deleteEntry(s);
     document.getElementById("d-history").onclick = () =>
       location.href = "versions.html?path=" + encodeURIComponent(s.path);

@@ -10,7 +10,7 @@
 纯 Python（标准库，零第三方依赖）+ 原生 HTML/CSS/JS 实现的**教学级分布式文件系统**：
 模拟 HDFS 风格的 NameNode / DataNode 集群（节点间全 HTTP 通信），
 在其上叠加 Git 风格的版本控制（提交 / 分支 / 三方合并 / 检出），
-并提供 11 个页面的管理控制台。
+并提供 12 个页面的管理控制台。
 
 代码规模：**约 12,000 行**（后端 ~8,700 行 Python，前端 ~4,400 行 HTML/CSS/JS）。
 
@@ -43,7 +43,7 @@ python3 -m backend.datanode --id dn5 --port 8025
 
 ---
 
-## 2. 前端页面（11 个，要求 10 个 + 仪表盘）
+## 2. 前端页面（12 个，要求 10 个 + 仪表盘）
 
 | 页面 | 文件 | 内容 |
 |---|---|---|
@@ -51,6 +51,7 @@ python3 -m backend.datanode --id dn5 --port 8025
 | 文件浏览 | `files.html` | 目录树 + 缩略图网格 + 面包屑 + 块/副本详情抽屉 + 文本预览 |
 | 上传下载 | `transfer.html` | 分块上传（分片可视化、暂停/续传/混沌模式）、Range 分段下载（断点续传、sha256 校验、副本命中统计） |
 | 版本历史 | `versions.html` | 提交时间线（泳道）、分支管理、提交/合并/检出、冲突展示、文件级历史与回滚 |
+| 逐行溯源 | `blame.html` | 行级提交/作者/时间着色、合并带入标记、虚拟滚动、点击直达提交差异 |
 | 差异对比 | `diff.html` | 版本 diff + 文本 diff 双模式、Myers/Patience/difflib 选择、unified/双栏视图、行内字符级高亮、大文件性能试验台 |
 | 节点状态 | `nodes.html` | 节点卡片（心跳/容量/IO/版本向量）、块×节点副本矩阵、恢复队列、杀死/复活/注入损坏演练、实时事件流 |
 | 存储统计 | `stats.html` | 容量 donut、副本数分布、块大小直方图、24h 吞吐、容量趋势、类型分布、热度榜（sparkline）、元数据文档表 |
@@ -67,7 +68,7 @@ python3 -m backend.datanode --id dn5 --port 8025
 ## 3. 架构
 
 ```
-┌──────────────────────────── 浏览器（11 页面）────────────────────────────┐
+┌──────────────────────────── 浏览器（12 页面）────────────────────────────┐
 │  fetch /api/*（JSON）· /api/download（Range）· /api/thumbnail           │
 └───────────────────────────────────┬──────────────────────────────────────┘
                                     │ HTTP（Bearer 令牌 + 路径 ACL）
@@ -135,6 +136,9 @@ data/datanodes/<node_id>/doc_cache/*.json   # DN 同步到的元数据文档
   二进制冲突保留 ours 并记录。合并产生双亲 commit。
 * 检出 = 快照物化回活动 inode 树；工作区脏时自动提交保护（不丢数据）；
   快进合并自动识别。
+* 逐行溯源（blame）沿提交 DAG 回溯；合并提交按 first-parent 口径只先匹配
+  本分支父提交，其它父带入的行保留真实作者，并用 `via_merge` 标注合并入口；
+  后端按行分页，前端使用定高虚拟滚动，保证行号/标注/内容严格对齐。
 
 ### 4.4 大文件差异对比性能（diff_engine.py）
 * **Myers O(ND)**：贪心 + 轨迹回溯，带公共前缀/后缀裁剪；
@@ -169,7 +173,7 @@ GET  /api/fs/tree|list|stat      POST /api/fs/mkdir|rename|move|delete
 GET  /api/thumbnail|file/preview|file/blocks
 POST /api/upload/begin|chunk|complete      GET /api/upload/status|sessions
 GET  /api/download/info|download(Range)
-GET  /api/version/branches|commits|graph|diff|working_diff|file_at|history|stats
+GET  /api/version/branches|commits|commit|graph|diff|working_diff|file_at|history|blame|stats
 POST /api/version/commit|branch|branch_delete|checkout|merge|restore|diff_text
 GET  /api/nodes|nodes/blocks|nodes/matrix|nodes/block_paths
 GET  /api/health/queue           GET /api/sim/events
@@ -204,7 +208,7 @@ gsb4/
 │   ├── http_server.py         # 路由 + 静态页 + 鉴权中间件
 │   ├── seed.py                # 演示数据（含冲突合并场景）
 │   └── main.py                # 集群装配
-├── frontend/                  # 11 页面 + css/app.css + js/app.js
+├── frontend/                  # 12 页面 + css/app.css + js/app.js
 └── tests/smoke_test.py        # 97 项端到端断言
 ```
 
